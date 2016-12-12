@@ -5,6 +5,7 @@ package bbhw
 import (
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 )
 
@@ -14,6 +15,14 @@ type SysfsGPIO struct {
 	Number uint
 	fd     *os.File
 }
+
+// Constants for GPIO edge callbacks through sysfs.
+const (
+	RISING = iota
+	FALLING
+	BOTH
+	NONE
+)
 
 // SysFS managed GPIO ------------------------------------
 
@@ -116,6 +125,43 @@ func (gpio *SysfsGPIO) CheckDirection() (direction int, err error) {
 	return
 }
 
+func (gpio *SysfsGPIO) GetEdge() (edge string, err error) {
+	var df *os.File
+	var n int
+	err = nil
+	edge = ""
+	if gpio == nil {
+		panic("gpio == nil")
+	}
+	filename := fmt.Sprintf("/sys/class/gpio/gpio%d/edge", gpio.Number)
+	df, err = os.OpenFile(filename, os.O_RDONLY|os.O_SYNC, 0666)
+	if err != nil {
+		return
+	}
+	defer df.Close()
+	buf := make([]byte, 16)
+	df.Seek(0, 0)
+	n, err = df.Read(buf) //go knows how long our buf is, right ??
+	if err != nil {
+		return
+	}
+	if n == 0 {
+		err = errors.New("Edge file is empty")
+	}
+	if string(buf)[0:4] == "none" {
+		edge = "none"
+	} else if string(buf)[0:4] == "both" {
+		edge = "both"
+	} else if string(buf)[0:6] == "rising" {
+		edge = "rising"
+	} else if string(buf)[0:7] == "falling" {
+		edge = "falling"
+	} else {
+		err = errors.New("Invalid edge state")
+	}
+	return
+}
+
 func (gpio *SysfsGPIO) SetDirection(direction int) error {
 	if gpio == nil {
 		panic("gpio == nil")
@@ -150,6 +196,64 @@ func (gpio *SysfsGPIO) SetActiveLow(activelow bool) error {
 	} else {
 		fmt.Fprintln(df, "0")
 	}
+	return nil
+}
+
+func (gpio *SysfsGPIO) SetEdge(edge int) error {
+	if gpio == nil {
+		panic("gpio == nil")
+	}
+	df, err := os.OpenFile(fmt.Sprintf("/sys/class/gpio/gpio%d/edge", gpio.Number),
+		os.O_WRONLY|os.O_SYNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if edge == RISING {
+		fmt.Fprintln(df, "rising")
+	} else if edge == FALLING {
+		fmt.Fprintln(df, "falling")
+	} else if edge == BOTH {
+		fmt.Fprintln(df, "both")
+	} else if edge == NONE {
+		fmt.Fprintln(df, "none")
+	} else {
+		return errors.New("Edge value invalid")
+	}
+	return nil
+}
+
+// Monitor pin using Unix Poll with a specified timeout (negative value for infinite timeout)
+func (gpio *SysfsGPIO) SetEdgeCallback(callback *chan bool, timeout int) error {
+	if gpio == nil {
+		panic("gpio == nil")
+	}
+	edge, err := gpio.GetEdge()
+	if err != nil {
+		return err
+	}
+	if edge == "none" {
+		err = errors.New("Edge value is set to NONE")
+		return err
+	}
+	go func() {
+		defer close(*callback)
+
+		for {
+			//First do a dummy read before we poll
+			gpio.GetState()
+			fds := []unix.PollFd{{Fd: int32(gpio.fd.Fd()), Events: unix.POLLPRI}}
+			_, err := unix.Poll(fds, timeout)
+			if err != nil {
+				break
+			}
+			state, err := gpio.GetState()
+			if err != nil {
+				break
+			}
+			*callback <- state
+		}
+	}()
 	return nil
 }
 
